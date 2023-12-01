@@ -1,10 +1,8 @@
-//go:build filesyncv3
-// +build filesyncv3
-
 package types
 
 import (
 	"encoding/json"
+	"github.com/go-redis/redis"
 	"github.com/rjeczalik/notify"
 )
 
@@ -12,12 +10,13 @@ const FileChange = "file_changes"
 
 type FileChanges struct {
 	FilePath     string       // 变化的文件(或目录)相对路径
+	PublishFrom  string       // 标识此消息来自哪个节点
 	IsDir        bool         // 变化的是目录名
 	ChangeType   notify.Event // 变化类型
 	BeforeName   string       // 变化之前的名字 用于Rename的情况处理
 	AfterContent []byte       // 变化之后的文件内容
 	LastUpdate   int64        // 最后更新时间戳
-	//FileVersion  int64        // 文件版本号
+	FileVersion  int64        // 文件版本号 防止反复广播同一个文件
 }
 
 type Option func(*FileChanges)
@@ -46,6 +45,12 @@ func WithBeforeName(beforeName string) Option {
 	}
 }
 
+func WithPublishFrom(from string) Option {
+	return func(changes *FileChanges) {
+		changes.PublishFrom = from
+	}
+}
+
 func NewFileChanges(filename string, changeType notify.Event, opts ...Option) []byte {
 	fc := FileChanges{
 		FilePath:   filename,
@@ -58,4 +63,11 @@ func NewFileChanges(filename string, changeType notify.Event, opts ...Option) []
 
 	fcb, _ := json.Marshal(fc)
 	return fcb
+}
+
+func Msg2FileChanges(msg *redis.Message) FileChanges {
+	fc := FileChanges{}
+	_ = json.Unmarshal([]byte(msg.Payload), &fc)
+
+	return fc
 }

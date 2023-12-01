@@ -1,12 +1,10 @@
-//go:build filesyncv3
-// +build filesyncv3
-
 package api
 
 import (
 	"errors"
+	"filesyncv3/app"
 	"filesyncv3/types"
-	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -40,26 +38,39 @@ func Init(beforeExit func()) {
 	}()
 
 	// 这个不能放到init中执行 因为init比main还要先执行 此时db是尚未连接的状态 相关数据获取不到
-	//loadConfig()
+	loadCache()
 
 	// 监听退出信号 注意：kill -9信号是无法被监听的
 	go func() {
 		code := <-exitChan
+		_ = types.SaveCacheToFile(types.SyncCachePath)
+		_ = app.NewFileSyncClient().SavePrivateKey()
 		beforeExit()
 		os.Exit(code)
 	}()
 }
 
-func loadConfig() {
-	// todo
-	//validConfig(&types.GlobalFileSyncConfig)
+func loadCache() {
 	initDone = true
+	_, err := os.Stat(types.SyncCachePath)
+	if errors.Is(err, os.ErrNotExist) {
+		// 第一次启动 缓存文件不存在 正常
+		return
+	} else if err != nil {
+		log.Println(err)
+		return
+	}
+
+	err = types.LoadCacheFromFile(types.SyncCachePath)
+	if err != nil {
+		log.Println(err)
+	}
 }
 
 // 检查配置参数是否合法
 func validConfig(config *types.SyncConfig) {
 	if config.Redis2DBInterval == 0 {
-		config.Redis2DBInterval = 1000
-		fmt.Println(errors.New("文件同步间隔不能为0,已设置为1000ms"))
+		config.Redis2DBInterval = 600
+		log.Println("写入间隔不能为0,已设置为600s")
 	}
 }

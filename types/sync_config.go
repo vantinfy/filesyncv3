@@ -1,6 +1,7 @@
 package types
 
 import (
+	"github.com/BurntSushi/toml"
 	"log"
 	"os"
 	"strings"
@@ -18,23 +19,52 @@ import (
 
 // SyncConfig 同步配置信息
 type SyncConfig struct {
-	WatchPath        string `comment:"监听同步的路径" json:"watch_path"`
-	PathPrefix       string `comment:"文件（夹）变化的路径前缀" json:"path_prefix"`
-	Redis2DBInterval int64  `comment:"同步文件数据写到db间隔 单位毫秒" json:"redis_2_db_interval"`
-	RedisDBIndex     int    `comment:"根据index使用redis的指定db" json:"redis_db_index"`
+	PathConfig  `toml:"path_config"`
+	RedisConfig `toml:"redis_config"`
+	DBConfig    `toml:"db_config"`
 }
 
+// PathConfig 路径相关配置
+type PathConfig struct {
+	WatchPath  string `toml:"watch_path"`  // 监听同步的路径
+	PathPrefix string `toml:"path_prefix"` // 文件（夹）变化的路径前缀
+}
+
+// RedisConfig redis相关配置
+type RedisConfig struct {
+	RedisAddr        string `toml:"redis_addr"`          // redis连接地址
+	RedisPwd         string `toml:"redis_pwd"`           // redis连接密码
+	RedisDBIndex     int    `toml:"redis_db_index"`      // 根据index使用redis的指定db
+	Redis2DBInterval int64  `toml:"redis_2_db_interval"` // 同步文件数据写到db间隔 单位秒
+}
+
+// DBConfig db相关配置 主要是记录和维护同步文件（夹）的信息
+type DBConfig struct {
+	// todo 建表
+	Enable    bool   `toml:"enable"`     // 是否启用这个配置
+	DBType    string `toml:"db_type"`    // db类型
+	ConnLink  string `toml:"conn_link"`  // 连接参数
+	TableName string `toml:"table_name"` // 表名
+}
+
+const ConfigFilePath = "config.toml"
+
 func (sc *SyncConfig) LoadConfig() {
+	_, err := toml.DecodeFile(ConfigFilePath, sc)
+	if err != nil {
+		log.Println("load config failed", err)
+		return
+	}
+
 	sc.PathPrefix = strings.TrimSuffix(sc.WatchPath, "...")
 
 	pathInfo, err := os.Stat(sc.PathPrefix)
 	if err != nil {
 		// 监听的路径不存在就创建
-		os.MkdirAll(sc.PathPrefix, 0644)
+		_ = os.MkdirAll(sc.PathPrefix, 0644)
+		return
 	}
 	if !pathInfo.IsDir() {
-		log.Println("同步文件夹错误")
+		log.Println("invalid sync path")
 	}
 }
-
-// todo 建表

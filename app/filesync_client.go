@@ -1,10 +1,6 @@
-//go:build filesyncv3
-// +build filesyncv3
-
 package app
 
 import (
-	"encoding/json"
 	"filesyncv3/types"
 	"fmt"
 	"github.com/go-redis/redis"
@@ -17,22 +13,27 @@ import (
 type FileSyncClient struct {
 	*redis.Client
 	types.SyncConfig
+	types.NodeInfo
 }
 
 var fileSyncClient *FileSyncClient
 
 func NewFileSyncClient() *FileSyncClient {
 	if fileSyncClient == nil {
+		syncConfig := &types.SyncConfig{}
+		syncConfig.LoadConfig()
+
 		o := redis.Options{
-			Addr:     "192.168.10.117:6379",
-			Password: "",
-			DB:       7,
+			Addr:     syncConfig.RedisAddr,
+			Password: syncConfig.RedisPwd,
+			DB:       syncConfig.RedisDBIndex,
 		}
 		fileSyncClient = &FileSyncClient{
 			Client:     redis.NewClient(&o),
-			SyncConfig: types.SyncConfig{},
+			SyncConfig: *syncConfig,
+			NodeInfo:   types.NodeInfo{},
 		}
-		fileSyncClient.LoadConfig()
+		_ = fileSyncClient.LoadPrivateKey()
 	}
 	return fileSyncClient
 }
@@ -41,6 +42,11 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 	for {
 		ei := <-eventChan
 		fmt.Println("wait...", ei)
+		// .sync_cache和.key文件不同步
+		if fsc.SameFile(ei.Path(), types.SyncCachePath) || fsc.SameFile(ei.Path(), types.KeyPath) {
+			continue
+		}
+
 		switch ei.Event() {
 		case notify.Write:
 			fileInfo, err := os.Stat(ei.Path())
@@ -53,20 +59,25 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 				continue
 			}
 			fmt.Println("after content", string(afterContent), ei.Path())
-			fsc.Publish(types.FileChange, types.NewFileChanges(fsc.CalculateRelativePath(ei.Path()), ei.Event(), types.WithFileContent(afterContent), types.WithLastUpdate(fileInfo.ModTime().UnixNano())))
+			fsc.Publish(types.FileChange, types.NewFileChanges(fsc.CalculateRelativePath(ei.Path()), ei.Event(),
+				types.WithFileContent(afterContent),
+				types.WithLastUpdate(fileInfo.ModTime().UnixNano()),
+				types.WithPublishFrom(fsc.UniqueId)))
 		case notify.Create, notify.Remove:
 			fileInfo, err := os.Stat(ei.Path())
 			if err != nil {
 				continue
 			}
-			fsc.Publish(types.FileChange, types.NewFileChanges(fsc.CalculateRelativePath(ei.Path()), ei.Event(), types.WithIsDir(fileInfo.IsDir())))
+			fsc.Publish(types.FileChange, types.NewFileChanges(fsc.CalculateRelativePath(ei.Path()), ei.Event(),
+				types.WithIsDir(fileInfo.IsDir()),
+				types.WithPublishFrom(fsc.UniqueId)))
 		case notify.Rename:
 			// linux下的重命名 跟windows逻辑不太一样 前者是rename+create 后者是double rename
 			//if runtime.GOOS == "linux" {
 			//	continue
 			//}
 			fmt.Println("", ei) // 重命名的情况下 会走两次 todo
-			fsc.Publish(types.FileChange, types.NewFileChanges(fsc.CalculateRelativePath(ei.Path()), ei.Event()))
+			fsc.Publish(types.FileChange, types.NewFileChanges(fsc.CalculateRelativePath(ei.Path()), ei.Event(), types.WithPublishFrom(fsc.UniqueId)))
 		}
 	}
 }
@@ -77,11 +88,28 @@ func (fsc *FileSyncClient) CalculateRelativePath(changePath string) string {
 	return rel
 }
 
+func (fsc *FileSyncClient) SameFile(path1, path2 string) bool {
+	absPath1, err := filepath.Abs(path1)
+	if err != nil {
+		return false
+	}
+	absPath2, err := filepath.Abs(path2)
+	if err != nil {
+		return false
+	}
+
+	return filepath.Clean(absPath1) == filepath.Clean(absPath2)
+}
+
 // Synchronize 接收到文件（夹）变化时 进行同步
 func (fsc *FileSyncClient) Synchronize(message *redis.Message) {
-	fc := types.FileChanges{}
-	_ = json.Unmarshal([]byte(message.Payload), &fc)
+	fc := types.Msg2FileChanges(message)
 	fc.FilePath = filepath.Join(fsc.PathPrefix, fc.FilePath) // 相对路径还原绝对路径
+
+	if fc.PublishFrom == fsc.UniqueId {
+		// 如果是自己广播的消息 不处理
+		return
+	}
 	//fmt.Println("got file changes", fc)
 	//return
 
