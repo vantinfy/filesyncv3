@@ -1,0 +1,15 @@
+[path_config]
+watch_path = "C:\\Users\\vv\\Desktop\\notify_watch\\..."
+path_prefix = ""
+
+[redis_config]
+redis_addr = "192.168.10.117:6379"
+redis_pwd = ""
+redis_db_index = 7
+redis_2_db_interval = 600 # 单位秒
+
+[db_config]
+enable = false
+db_type = "mysql"
+conn_link = ""
+table_name = "sync_status"
