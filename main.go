@@ -9,7 +9,11 @@ import (
 )
 
 func main() {
-	api.Init(func() {})
+	types.InitDB()
+	api.Init(func() {
+		// 退出前关闭数据库连接
+		types.CloseDb()
+	})
 
 	eventChan := make(chan notify.EventInfo, 1e2)
 	syncClient := app.NewFileSyncClient()
@@ -24,6 +28,7 @@ func main() {
 
 	// 监听文件变化的协程
 	go syncClient.Watch(eventChan)
+	log.Println("service started")
 
 	pubCh := syncClient.Subscribe(types.FileChange)
 	defer pubCh.Close()

@@ -14,17 +14,17 @@ const SyncCachePath = ".sync_cache"
 
 var (
 	Mutex            sync.Mutex
-	FileVersionCache = cache.New(5*time.Minute, 10*time.Minute)
+	FileVersionCache = cache.New(cache.NoExpiration, cache.NoExpiration)
 )
 
-func UpdateFileVersion(filePath string, newVersion int) {
+func UpdateCacheVersion(filePath string, newVersion int) {
 	Mutex.Lock()
 	defer Mutex.Unlock()
 
 	FileVersionCache.Set(filePath, newVersion, cache.DefaultExpiration)
 }
 
-func GetFileVersion(filePath string) (int, bool) {
+func GetCacheVersion(filePath string) (int, bool) {
 	Mutex.Lock()
 	defer Mutex.Unlock()
 
@@ -72,7 +72,7 @@ func LoadCacheFromFile(filename string) error {
 	decoder := gob.NewDecoder(file)
 	var item cacheItem
 	for {
-		if err := decoder.Decode(&item); err != nil {
+		if err = decoder.Decode(&item); err != nil {
 			break
 		}
 		FileVersionCache.Set(item.Key, item.Value, item.Expiration.Sub(time.Now()))

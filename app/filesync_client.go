@@ -5,14 +5,15 @@ import (
 	"fmt"
 	"github.com/go-redis/redis"
 	"github.com/rjeczalik/notify"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
 )
 
 type FileSyncClient struct {
-	*redis.Client
-	types.SyncConfig
+	*types.RedisClient
+	*types.SyncConfig
 	types.NodeInfo
 }
 
@@ -20,18 +21,15 @@ var fileSyncClient *FileSyncClient
 
 func NewFileSyncClient() *FileSyncClient {
 	if fileSyncClient == nil {
-		syncConfig := &types.SyncConfig{}
-		syncConfig.LoadConfig()
+		syncConfig := types.GetConfig()
 
-		o := redis.Options{
-			Addr:     syncConfig.RedisAddr,
-			Password: syncConfig.RedisPwd,
-			DB:       syncConfig.RedisDBIndex,
-		}
+		redisClient := types.NewRedisClient(types.WithRedisAddr(syncConfig.RedisAddr),
+			types.WithRedisPwd(syncConfig.RedisPwd),
+			types.WithRedisDB(syncConfig.RedisDBIndex))
 		fileSyncClient = &FileSyncClient{
-			Client:     redis.NewClient(&o),
-			SyncConfig: *syncConfig,
-			NodeInfo:   types.NodeInfo{},
+			RedisClient: redisClient,
+			SyncConfig:  syncConfig,
+			NodeInfo:    types.NodeInfo{},
 		}
 		_ = fileSyncClient.LoadPrivateKey()
 	}
@@ -58,7 +56,12 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 			if err != nil {
 				continue
 			}
-			fmt.Println("after content", string(afterContent), ei.Path())
+			relPath := fsc.CalculateRelativePath(ei.Path())
+			fmt.Println("after content", string(afterContent), relPath)
+
+			if !fsc.CheckVersion(relPath) {
+				continue
+			}
 			fsc.Publish(types.FileChange, types.NewFileChanges(fsc.CalculateRelativePath(ei.Path()), ei.Event(),
 				types.WithFileContent(afterContent),
 				types.WithLastUpdate(fileInfo.ModTime().UnixNano()),
@@ -101,13 +104,33 @@ func (fsc *FileSyncClient) SameFile(path1, path2 string) bool {
 	return filepath.Clean(absPath1) == filepath.Clean(absPath2)
 }
 
+func (fsc *FileSyncClient) CheckVersion(key string) bool {
+	redisVersion, err := fsc.RedisClient.GetKey(key)
+	cacheVersion, ok := types.GetCacheVersion(key)
+	if err != nil && !ok {
+		// 大概率因为第一次对该key操作 所以redis、cache跟db都没有对应的值
+		log.Println("get redis version failed", err)
+	}
+
+	if redisVersion == cacheVersion {
+		err = fsc.RedisClient.SetKey(key, redisVersion+1)
+		if err != nil {
+			log.Println("redis set key failed", key, redisVersion+1)
+			return false
+		}
+		return true
+	}
+	return false
+}
+
 // Synchronize 接收到文件（夹）变化时 进行同步
 func (fsc *FileSyncClient) Synchronize(message *redis.Message) {
 	fc := types.Msg2FileChanges(message)
 	fc.FilePath = filepath.Join(fsc.PathPrefix, fc.FilePath) // 相对路径还原绝对路径
 
 	if fc.PublishFrom == fsc.UniqueId {
-		// 如果是自己广播的消息 不处理
+		// 如果是自己广播的消息 不写文件 只更新version
+		types.UpdateCacheVersion(fc.FilePath, fc.FileVersion)
 		return
 	}
 	//fmt.Println("got file changes", fc)
@@ -121,7 +144,9 @@ func (fsc *FileSyncClient) Synchronize(message *redis.Message) {
 			fmt.Println("write change content failed", err)
 			// 协程定期尝试重试更新
 			go fsc.TryWriteFile(fc)
+			break
 		}
+		types.UpdateCacheVersion(fc.FilePath, fc.FileVersion)
 
 	case notify.Create:
 		var err error

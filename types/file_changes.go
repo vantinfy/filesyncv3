@@ -16,7 +16,7 @@ type FileChanges struct {
 	BeforeName   string       // 变化之前的名字 用于Rename的情况处理
 	AfterContent []byte       // 变化之后的文件内容
 	LastUpdate   int64        // 最后更新时间戳
-	FileVersion  int64        // 文件版本号 防止反复广播同一个文件
+	FileVersion  int          // 文件版本号 防止反复广播同一个文件
 }
 
 type Option func(*FileChanges)

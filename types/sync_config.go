@@ -49,6 +49,17 @@ type DBConfig struct {
 
 const ConfigFilePath = "config.toml"
 
+var syncConfig *SyncConfig
+
+func GetConfig() *SyncConfig {
+	if syncConfig == nil {
+		syncConfig = &SyncConfig{}
+		syncConfig.LoadConfig()
+	}
+
+	return syncConfig
+}
+
 func (sc *SyncConfig) LoadConfig() {
 	_, err := toml.DecodeFile(ConfigFilePath, sc)
 	if err != nil {
