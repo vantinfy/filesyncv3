@@ -51,6 +51,12 @@ func WithPublishFrom(from string) Option {
 	}
 }
 
+func WithVersion(version int) Option {
+	return func(changes *FileChanges) {
+		changes.FileVersion = version
+	}
+}
+
 func NewFileChanges(filename string, changeType notify.Event, opts ...Option) []byte {
 	fc := FileChanges{
 		FilePath:   filename,
