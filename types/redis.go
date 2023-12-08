@@ -57,7 +57,7 @@ func (r *RedisClient) Close() {
 	_ = r.Client.Close()
 }
 
-func (r *RedisClient) SetKey(key string, version int) error {
+func (r *RedisClient) SetKey(key string, version int, nodeId string) error {
 	// 如果key过期前被重新set了一遍 则取消之前的到期写db协程（也就是下面的go func）
 	cancel, ok := r.WriteCancel[key]
 	if ok {
@@ -91,7 +91,7 @@ func (r *RedisClient) SetKey(key string, version int) error {
 			defer r.mu.Unlock()
 
 			// 走这个分支说明key到了过期的时间依然没有被更新过 因此可以将version写到db
-			_, err = UpdateDBVersion(key, version)
+			_, err = UpdateDBVersion(key, version, nodeId)
 			if err != nil {
 				log.Println(err)
 			}
@@ -110,11 +110,11 @@ func (r *RedisClient) GetKey(key string) (int, error) {
 		if !ok {
 			return 0, errors.New("both redis and db have not key[" + key + "]")
 		}
-		err = r.SetKey(key, dbv)
+		err = r.SetKey(key, dbv.Version, dbv.NodeId)
 		if err != nil {
 			return 0, err
 		}
-		version = dbv
+		version = dbv.Version
 	}
 	return version, nil
 }

@@ -2,17 +2,18 @@ package types
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
 	"log"
 	"strings"
+	"time"
 )
 
 type DBConn struct {
-	*sql.DB
-	DBType string
+	*sqlx.DB
 }
 
 var dbConn *DBConn
@@ -38,8 +39,7 @@ func InitDB() {
 			return
 		}
 		dbConn = &DBConn{
-			DB:     db,
-			DBType: cfg.DBType,
+			DB: sqlx.NewDb(db, cfg.DBType),
 		}
 		createTable(cfg.DBConfig.TableName)
 	}
@@ -81,51 +81,74 @@ func CloseDb() {
 }
 
 func createTable(tableName string) {
-	dbx := sqlx.NewDb(dbConn.DB, dbConn.DBType)
 	// id INT AUTO_INCREMENT PRIMARY KEY,
 	createSql := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS`+` %s (
     filepath VARCHAR(255) PRIMARY KEY,
     version INT NOT NULL,
+    node_id VARCHAR(255) NOT NULL,
     update_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );`, tableName)
 
-	_, err := dbx.Exec(createSql)
+	_, err := dbConn.Exec(createSql)
 	if err != nil {
 		log.Println("create table", tableName, err)
 	}
 }
 
-func UpdateDBVersion(path string, version int) (sql.Result, error) {
-	dbx := sqlx.NewDb(dbConn.DB, dbConn.DBType)
-	updateSql := fmt.Sprintf(`INSERT INTO %s`+` (filepath, version)
-VALUES (?, ?)
+type VersionInfo struct {
+	FilePath string    `json:"file_path,omitempty"`
+	Version  int       `json:"version,omitempty"`
+	NodeId   string    `json:"node_id,omitempty"`
+	UpdateAt time.Time `json:"update_at"`
+}
+
+func (v *VersionInfo) TableName() string {
+	return GetConfig().DBConfig.TableName
+}
+
+func (v *VersionInfo) MarshalBinary() ([]byte, error) {
+	return json.Marshal(v)
+}
+
+func (v *VersionInfo) UnmarshalBinary(data []byte) error {
+	return json.Unmarshal(data, &v)
+}
+
+func UpdateDBVersion(path string, version int, nodeId string) (sql.Result, error) {
+	updateSql := fmt.Sprintf(`INSERT INTO %s`+` (filepath, version, node_id)
+VALUES (?, ?, ?)
 ON DUPLICATE KEY UPDATE
 version = VALUES(version),
 update_at = VALUES(update_at);
 `, GetConfig().TableName)
-	return dbx.Exec(updateSql, path, version)
+	return dbConn.Exec(updateSql, path, version, nodeId)
 }
 
-func QueryDBVersion(path string) (int, bool) {
-	dbx := sqlx.NewDb(dbConn.DB, dbConn.DBType)
-	querySql := fmt.Sprintf(`select version from %s where filepath = ?`, GetConfig().TableName)
+func QueryDBVersion(path string) (VersionInfo, bool) {
+	querySql := fmt.Sprintf(`select version, node_id from %s where filepath = ?`, GetConfig().TableName)
 
-	var version int
-	err := dbx.Get(&version, querySql, path)
+	vi := VersionInfo{}
+	err := dbConn.Get(&vi, querySql, path)
 	if err != nil {
-		return 0, false
+		return vi, false
 	}
-	return version, true
+	return vi, true
+}
+
+func AllVersionInfo() ([]VersionInfo, error) {
+	querySql := fmt.Sprintf(`select filepath, version, node_id from %s`, GetConfig().TableName)
+
+	vis := make([]VersionInfo, 0)
+	return vis, dbConn.Select(&vis, querySql)
 }
 
 func Exec(sql string) (sql.Result, error) {
-	dbx := sqlx.NewDb(dbConn.DB, dbConn.DBType)
 	// dbx.Exec("INSERT INTO your_table (name) VALUES (?)", "John Doe")
-	return dbx.Exec(sql)
+	return dbConn.Exec(sql)
 }
 
 // Get get通常查询单行数据
 func Get(dest any, sql string, args ...any) error {
 	// dbx.Get(&name, "SELECT id, name FROM your_table WHERE id = ?", 1)
-	return sqlx.NewDb(dbConn.DB, dbConn.DBType).Get(dest, sql, args)
+	return dbConn.Get(dest, sql, args)
 }

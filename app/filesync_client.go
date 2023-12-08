@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"encoding/json"
 	"filesyncv3/types"
 	"fmt"
 	"github.com/go-redis/redis"
@@ -34,6 +36,108 @@ func NewFileSyncClient() *FileSyncClient {
 		_ = fileSyncClient.LoadPrivateKey()
 	}
 	return fileSyncClient
+}
+
+func (fsc *FileSyncClient) ListenAsk(ctx context.Context) {
+	pubCh := fsc.Subscribe(types.VersionCompare)
+	defer pubCh.Close()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			msg, err := pubCh.ReceiveMessage()
+			if err != nil {
+				log.Println("listen ask: receive msg failed", err)
+				continue
+			}
+			ak := ask{}
+			_ = json.Unmarshal([]byte(msg.Payload), &ak)
+			// 不是向自己ask的msg 忽略
+			if ak.NodeId != fsc.UniqueId {
+				continue
+			}
+
+			// 发送文件
+			content, err := os.ReadFile(filepath.Join(fsc.PathPrefix, ak.FilePath))
+			if err != nil {
+				log.Println("listen ask: read file failed", err)
+				continue
+			}
+			ans := answer{
+				FileChanges: types.FileChanges{
+					FilePath:     ak.FilePath,
+					PublishFrom:  fsc.UniqueId,
+					AfterContent: content,
+				}, SendTo: ak.AskFrom}
+			ansBytes, _ := json.Marshal(ans)
+			fsc.Publish(types.ChasingFile, ansBytes)
+		}
+	}
+}
+
+type ask struct {
+	types.VersionInfo
+	AskFrom string `json:"ask_from"`
+}
+
+type answer struct {
+	types.FileChanges
+	SendTo string `json:"send_to"`
+}
+
+// Ask 启动的时候询问其它节点 获取他们本地的cache文件版本 比较自己本地cache version并下载其中最大的
+func (fsc *FileSyncClient) Ask() {
+	ctx, cancel := context.WithCancel(context.Background())
+	versions, err := types.AllVersionInfo()
+	if err != nil {
+		cancel()
+		return
+	}
+
+	go func() {
+		pubCh := fsc.Subscribe(types.ChasingFile)
+		defer pubCh.Close()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				msg, err := pubCh.ReceiveMessage()
+				if err != nil {
+					log.Println("ask chasing file failed", err)
+					continue
+				}
+				ans := answer{}
+				_ = json.Unmarshal([]byte(msg.Payload), &ans)
+				// 不是发送给自己的文件 忽略
+				if ans.SendTo != fsc.UniqueId {
+					continue
+				}
+
+				err = os.WriteFile(ans.FilePath, ans.AfterContent, 0644)
+				if err != nil {
+					log.Println("ask chasing file failed", err)
+				}
+			}
+		}
+	}()
+
+	for _, version := range versions {
+		cacheVersion, ok := types.GetCacheVersion(version.FilePath)
+		if !ok || cacheVersion < version.Version {
+			// publish一次
+			ak := ask{VersionInfo: types.VersionInfo{
+				FilePath: version.FilePath, // ask文件路径
+				NodeId:   version.NodeId,   // 向此节点ask文件数据
+			}, AskFrom: fsc.UniqueId}
+			askBytes, _ := json.Marshal(ak)
+			fsc.Publish(types.VersionCompare, askBytes)
+		}
+	}
+	cancel()
 }
 
 func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
@@ -115,7 +219,7 @@ func (fsc *FileSyncClient) CheckVersion(key string) (int, bool) {
 	}
 
 	if redisVersion == cacheVersion {
-		err = fsc.RedisClient.SetKey(key, redisVersion+1)
+		err = fsc.RedisClient.SetKey(key, redisVersion+1, fsc.UniqueId)
 		if err != nil {
 			log.Println("redis set key failed", key, redisVersion+1)
 			return 0, false

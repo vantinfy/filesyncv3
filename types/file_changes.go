@@ -6,7 +6,11 @@ import (
 	"github.com/rjeczalik/notify"
 )
 
-const FileChange = "file_changes"
+const (
+	FileChange     = "file_changes"    // 用于文件变动时发送变动信息
+	VersionCompare = "version_compare" // 用于节点启动时 检查文件版本是否为最新
+	ChasingFile    = "chasing_file"    // 专门用于启动时 发送文件的订阅
+)
 
 type FileChanges struct {
 	FilePath     string       // 变化的文件(或目录)相对路径
