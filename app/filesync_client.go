@@ -87,11 +87,12 @@ type answer struct {
 	SendTo string `json:"send_to"`
 }
 
-// Ask 启动的时候询问其它节点 获取他们本地的cache文件版本 比较自己本地cache version并下载其中最大的
+// Ask 启动的时候 通过redis与数据库查询所有文件版本 比对本地cache 如果本地version落后则向其它节点请求文件
 func (fsc *FileSyncClient) Ask() {
 	ctx, cancel := context.WithCancel(context.Background())
-	versions, err := types.AllVersionInfo()
+	dbVersions, err := types.AllVersionInfo()
 	if err != nil {
+		log.Println("db get all version info failed", err)
 		cancel()
 		return
 	}
@@ -117,7 +118,8 @@ func (fsc *FileSyncClient) Ask() {
 					continue
 				}
 
-				err = os.WriteFile(ans.FilePath, ans.AfterContent, 0644)
+				//log.Println("got answer file", ans.FilePath)
+				err = os.WriteFile(filepath.Join(fsc.PathPrefix, ans.FilePath), ans.AfterContent, 0644)
 				if err != nil {
 					log.Println("ask chasing file failed", err)
 				}
@@ -125,13 +127,24 @@ func (fsc *FileSyncClient) Ask() {
 		}
 	}()
 
-	for _, version := range versions {
-		cacheVersion, ok := types.GetCacheVersion(version.FilePath)
-		if !ok || cacheVersion < version.Version {
-			// publish一次
+	// todo 后续还需要考虑path是目录的情况
+	redisVersions := fsc.RedisClient.ScanKeys()
+	for _, dbV := range dbVersions {
+		// db与redis都有的filepath 以redis为准
+		if _, ok := redisVersions[dbV.FilePath]; ok {
+			continue
+		} else {
+			redisVersions[dbV.FilePath] = dbV
+		}
+	}
+	//log.Println("try to chasing", redisVersions)
+	for _, info := range redisVersions {
+		cacheVersion, ok := types.GetCacheVersion(info.FilePath)
+		if !ok || cacheVersion < info.Version {
+			// publish 向目标节点请求下载文件
 			ak := ask{VersionInfo: types.VersionInfo{
-				FilePath: version.FilePath, // ask文件路径
-				NodeId:   version.NodeId,   // 向此节点ask文件数据
+				FilePath: info.FilePath, // ask文件路径
+				NodeId:   info.NodeId,   // 向此节点ask文件数据
 			}, AskFrom: fsc.UniqueId}
 			askBytes, _ := json.Marshal(ak)
 			fsc.Publish(types.VersionCompare, askBytes)
@@ -156,6 +169,7 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 				continue
 			}
 
+			// write的情况下 变化的一定是文件 不是目录
 			afterContent, err := os.ReadFile(ei.Path())
 			if err != nil {
 				continue
@@ -221,7 +235,7 @@ func (fsc *FileSyncClient) CheckVersion(key string) (int, bool) {
 	if redisVersion == cacheVersion {
 		err = fsc.RedisClient.SetKey(key, redisVersion+1, fsc.UniqueId)
 		if err != nil {
-			log.Println("redis set key failed", key, redisVersion+1)
+			log.Println("redis set key failed", key, redisVersion+1, err)
 			return 0, false
 		}
 		return redisVersion + 1, true

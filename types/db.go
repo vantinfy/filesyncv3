@@ -9,7 +9,6 @@ import (
 	"github.com/jmoiron/sqlx"
 	"log"
 	"strings"
-	"time"
 )
 
 type DBConn struct {
@@ -96,10 +95,10 @@ func createTable(tableName string) {
 }
 
 type VersionInfo struct {
-	FilePath string    `json:"file_path,omitempty"`
-	Version  int       `json:"version,omitempty"`
-	NodeId   string    `json:"node_id,omitempty"`
-	UpdateAt time.Time `json:"update_at"`
+	FilePath string `json:"file_path,omitempty" db:"filepath"`
+	Version  int    `json:"version,omitempty" db:"version"`
+	NodeId   string `json:"node_id,omitempty" db:"node_id"`
+	UpdateAt string `json:"update_at,omitempty" db:"update_at"` // 实际上对应数据库字段类型是时间
 }
 
 func (v *VersionInfo) TableName() string {

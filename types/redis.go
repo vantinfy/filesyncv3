@@ -50,7 +50,7 @@ func NewRedisClient(opts ...ROption) *RedisClient {
 	for _, option := range opts {
 		option(opt)
 	}
-	return &RedisClient{Client: redis.NewClient(opt)}
+	return &RedisClient{Client: redis.NewClient(opt), WriteCancel: map[string]context.CancelFunc{}}
 }
 
 func (r *RedisClient) Close() {
@@ -65,7 +65,11 @@ func (r *RedisClient) SetKey(key string, version int, nodeId string) error {
 	}
 
 	randExp := time.Duration(RandSeed.Int63n(10)+1) * time.Minute
-	_, err := r.Client.Set(KeyPrefix+key, version, BaseExpire+randExp).Result() // 基础+随机过期时间
+	vInfo := &VersionInfo{
+		Version: version,
+		NodeId:  nodeId,
+	}
+	_, err := r.Client.Set(KeyPrefix+key, vInfo, BaseExpire+randExp).Result() // 基础+随机过期时间
 	if err != nil {
 		//log.Printf("redis set key[%v] failed:[%v]\n", key, err)
 		return err
@@ -104,7 +108,8 @@ func (r *RedisClient) SetKey(key string, version int, nodeId string) error {
 
 func (r *RedisClient) GetKey(key string) (int, error) {
 	// redis没找到key 尝试在db找 如果db有说明key过期被删除 则重新set一次 db也没有则有错误
-	version, err := r.Client.Get(KeyPrefix + key).Int()
+	vInfo := VersionInfo{}
+	err := r.Client.Get(KeyPrefix + key).Scan(&vInfo)
 	if err != nil {
 		dbv, ok := QueryDBVersion(key)
 		if !ok {
@@ -114,22 +119,24 @@ func (r *RedisClient) GetKey(key string) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		version = dbv.Version
+		vInfo.Version = dbv.Version
 	}
-	return version, nil
+	return vInfo.Version, nil
 }
 
-func (r *RedisClient) ScanKeys() map[string]int {
-	keys := r.Client.Keys("").Val()
-	resp := make(map[string]int, len(keys))
+func (r *RedisClient) ScanKeys() map[string]VersionInfo {
+	keys := r.Client.Keys("*").Val()
+	resp := make(map[string]VersionInfo, len(keys))
 
 	for _, key := range keys {
-		version, err := r.Client.Get(key).Int()
+		vi := VersionInfo{}
+		err := r.Client.Get(key).Scan(&vi)
 		if err != nil {
 			log.Println("scan keys failed", err)
 			return resp
 		}
-		resp[key] = version
+		vi.FilePath = key
+		resp[key] = vi
 	}
 
 	return resp
