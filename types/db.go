@@ -128,14 +128,16 @@ func (v *VersionInfo) IsDel() bool {
 	return v.Flag&flagDel != 0
 }
 
-func UpdateDBVersion(path string, version int, nodeId string) (sql.Result, error) {
-	updateSql := fmt.Sprintf(`INSERT INTO %s`+` (filepath, version, node_id)
-VALUES (?, ?, ?)
+func UpdateDBVersion(path string, vi VersionInfo) (sql.Result, error) {
+	updateSql := fmt.Sprintf(`INSERT INTO %s`+` (filepath, version, flag, node_id)
+VALUES (?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
 version = VALUES(version),
+flag = VALUES(flag),
+node_id = VALUES(node_id),
 update_at = VALUES(update_at);
 `, GetConfig().TableName)
-	return dbConn.Exec(updateSql, path, version, nodeId)
+	return dbConn.Exec(updateSql, path, vi.Version, vi.Flag, vi.NodeId)
 }
 
 func QueryDBVersion(path string) (VersionInfo, bool) {

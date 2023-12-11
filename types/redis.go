@@ -57,7 +57,29 @@ func (r *RedisClient) Close() {
 	_ = r.Client.Close()
 }
 
-func (r *RedisClient) SetKey(key string, version int, nodeId string) error {
+type SetOption func(info *VersionInfo)
+
+func SetWithDel(isDel bool) SetOption {
+	return func(info *VersionInfo) {
+		if isDel {
+			info.Flag = info.Flag | flagDel
+		} else {
+			info.Flag = info.Flag &^ flagDel // 按位与非 置个位数为0
+		}
+	}
+}
+
+func SetWithDir(isDir bool) SetOption {
+	return func(info *VersionInfo) {
+		if isDir {
+			info.Flag = info.Flag | flagDir
+		} else {
+			info.Flag = info.Flag &^ flagDir
+		}
+	}
+}
+
+func (r *RedisClient) SetKey(key string, version int, nodeId string, options ...SetOption) error {
 	// 如果key过期前被重新set了一遍 则取消之前的到期写db协程（也就是下面的go func）
 	cancel, ok := r.WriteCancel[key]
 	if ok {
@@ -68,6 +90,9 @@ func (r *RedisClient) SetKey(key string, version int, nodeId string) error {
 	vInfo := &VersionInfo{
 		Version: version,
 		NodeId:  nodeId,
+	}
+	for _, option := range options {
+		option(vInfo)
 	}
 	_, err := r.Client.Set(KeyPrefix+key, vInfo, BaseExpire+randExp).Result() // 基础+随机过期时间
 	if err != nil {
@@ -95,7 +120,7 @@ func (r *RedisClient) SetKey(key string, version int, nodeId string) error {
 			defer r.mu.Unlock()
 
 			// 走这个分支说明key到了过期的时间依然没有被更新过 因此可以将version写到db
-			_, err = UpdateDBVersion(key, version, nodeId)
+			_, err = UpdateDBVersion(key, *vInfo)
 			if err != nil {
 				log.Println(err)
 			}

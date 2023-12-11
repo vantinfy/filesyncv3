@@ -200,19 +200,34 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 			if !ok {
 				continue
 			}
-			fsc.Publish(types.FileChange, types.NewFileChanges(fsc.CalculateRelativePath(ei.Path()), ei.Event(),
+			fsc.Publish(types.FileChange, types.NewFileChanges(relPath, ei.Event(),
 				types.WithFileContent(afterContent),
 				types.WithLastUpdate(fileInfo.ModTime().UnixNano()),
 				types.WithPublishFrom(fsc.UniqueId),
 				types.WithVersion(version)))
-		case notify.Create, notify.Remove:
+		case notify.Create:
+			relPath := fsc.CalculateRelativePath(ei.Path())
 			fileInfo, err := os.Stat(ei.Path())
 			if err != nil {
 				continue
 			}
-			fsc.Publish(types.FileChange, types.NewFileChanges(fsc.CalculateRelativePath(ei.Path()), ei.Event(),
+			version, ok := fsc.CheckVersion(relPath, types.SetWithDir(fileInfo.IsDir()))
+			if !ok {
+				continue
+			}
+			fsc.Publish(types.FileChange, types.NewFileChanges(relPath, ei.Event(),
 				types.WithIsDir(fileInfo.IsDir()),
-				types.WithPublishFrom(fsc.UniqueId)))
+				types.WithPublishFrom(fsc.UniqueId),
+				types.WithVersion(version)))
+		case notify.Remove:
+			relPath := fsc.CalculateRelativePath(ei.Path())
+			version, ok := fsc.CheckVersion(relPath, types.SetWithDel(true))
+			if !ok {
+				continue
+			}
+			fsc.Publish(types.FileChange, types.NewFileChanges(relPath, ei.Event(),
+				types.WithPublishFrom(fsc.UniqueId),
+				types.WithVersion(version)))
 		case notify.Rename:
 			// linux下的重命名 跟windows逻辑不太一样 前者是rename+create 后者是double rename
 			//if runtime.GOOS == "linux" {
@@ -243,7 +258,7 @@ func (fsc *FileSyncClient) SameFile(path1, path2 string) bool {
 	return filepath.Clean(absPath1) == filepath.Clean(absPath2)
 }
 
-func (fsc *FileSyncClient) CheckVersion(key string) (int, bool) {
+func (fsc *FileSyncClient) CheckVersion(key string, options ...types.SetOption) (int, bool) {
 	redisVersion, err := fsc.RedisClient.GetKey(key)
 	cacheVersion, ok := types.GetCacheVersion(key)
 	if err != nil && !ok {
@@ -252,7 +267,7 @@ func (fsc *FileSyncClient) CheckVersion(key string) (int, bool) {
 	}
 
 	if redisVersion == cacheVersion {
-		err = fsc.RedisClient.SetKey(key, redisVersion+1, fsc.UniqueId)
+		err = fsc.RedisClient.SetKey(key, redisVersion+1, fsc.UniqueId, options...)
 		if err != nil {
 			log.Println("redis set key failed", key, redisVersion+1, err)
 			return 0, false
