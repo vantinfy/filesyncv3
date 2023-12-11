@@ -84,6 +84,7 @@ func createTable(tableName string) {
 	createSql := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS`+` %s (
     filepath VARCHAR(255) PRIMARY KEY,
     version INT NOT NULL,
+	flag INT DEFAULT 0,
     node_id VARCHAR(255) NOT NULL,
     update_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );`, tableName)
@@ -97,6 +98,7 @@ func createTable(tableName string) {
 type VersionInfo struct {
 	FilePath string `json:"file_path,omitempty" db:"filepath"`
 	Version  int    `json:"version,omitempty" db:"version"`
+	Flag     int    `json:"flag,omitempty" db:"flag"` // 二进制位 个位数表示删除位 十位数表示是否为目录
 	NodeId   string `json:"node_id,omitempty" db:"node_id"`
 	UpdateAt string `json:"update_at,omitempty" db:"update_at"` // 实际上对应数据库字段类型是时间
 }
@@ -111,6 +113,19 @@ func (v *VersionInfo) MarshalBinary() ([]byte, error) {
 
 func (v *VersionInfo) UnmarshalBinary(data []byte) error {
 	return json.Unmarshal(data, &v)
+}
+
+const (
+	flagDel = 0b1      // 删除标志位
+	flagDir = 0b1 << 1 // 目录标志位
+)
+
+func (v *VersionInfo) IsDir() bool {
+	return v.Flag&flagDir != 0
+}
+
+func (v *VersionInfo) IsDel() bool {
+	return v.Flag&flagDel != 0
 }
 
 func UpdateDBVersion(path string, version int, nodeId string) (sql.Result, error) {
@@ -135,7 +150,7 @@ func QueryDBVersion(path string) (VersionInfo, bool) {
 }
 
 func AllVersionInfo() ([]VersionInfo, error) {
-	querySql := fmt.Sprintf(`select filepath, version, node_id from %s`, GetConfig().TableName)
+	querySql := fmt.Sprintf(`select filepath, version, flag, node_id from %s`, GetConfig().TableName)
 
 	vis := make([]VersionInfo, 0)
 	return vis, dbConn.Select(&vis, querySql)

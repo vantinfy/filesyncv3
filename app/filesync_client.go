@@ -88,7 +88,7 @@ type answer struct {
 }
 
 // Ask 启动的时候 通过redis与数据库查询所有文件版本 比对本地cache 如果本地version落后则向其它节点请求文件
-func (fsc *FileSyncClient) Ask() {
+func (fsc *FileSyncClient) Ask(done chan struct{}) {
 	ctx, cancel := context.WithCancel(context.Background())
 	dbVersions, err := types.AllVersionInfo()
 	if err != nil {
@@ -98,6 +98,8 @@ func (fsc *FileSyncClient) Ask() {
 	}
 
 	go func() {
+		// 确保这个协程跑完再关闭管道
+		defer close(done)
 		pubCh := fsc.Subscribe(types.ChasingFile)
 		defer pubCh.Close()
 
@@ -127,7 +129,6 @@ func (fsc *FileSyncClient) Ask() {
 		}
 	}()
 
-	// todo 后续还需要考虑path是目录的情况
 	redisVersions := fsc.RedisClient.ScanKeys()
 	for _, dbV := range dbVersions {
 		// db与redis都有的filepath 以redis为准
@@ -138,9 +139,27 @@ func (fsc *FileSyncClient) Ask() {
 		}
 	}
 	//log.Println("try to chasing", redisVersions)
+
+	//考虑了path是目录以及删除文件（夹）的情况
 	for _, info := range redisVersions {
+		// 如果该路径已经被标记删除 这里同样执行删除即可
+		if info.IsDel() {
+			err = os.RemoveAll(info.FilePath)
+			if err != nil {
+				log.Printf("ask chasing file, remove[%v] failed[%v]\n", info.FilePath, err)
+			}
+			continue
+		}
+		// 是目录的话 直接创建 不需要向其它节点请求下载
+		if info.IsDir() {
+			err = os.MkdirAll(info.FilePath, 0644)
+			if err != nil {
+				log.Printf("ask chasing file, mkdirAll[%v] failed[%v]\n", info.FilePath, err)
+			}
+			continue
+		}
 		cacheVersion, ok := types.GetCacheVersion(info.FilePath)
-		if !ok || cacheVersion < info.Version {
+		if (!ok || cacheVersion < info.Version) && !info.IsDir() {
 			// publish 向目标节点请求下载文件
 			ak := ask{VersionInfo: types.VersionInfo{
 				FilePath: info.FilePath, // ask文件路径

@@ -23,7 +23,10 @@ func main() {
 
 	go syncClient.ListenAsk(ctx)
 	// 启动时候先同步追赶文件到最新版本 之后再加入同步网络
-	syncClient.Ask()
+	done := make(chan struct{})
+	syncClient.Ask(done)
+	log.Println("synchronize chasing...")
+	<-done // 在Ask（主要是Ask里面的协程）执行完前阻塞
 
 	// 注意监听的目标是文件夹 不是具体文件
 	// 另外如果有需要监听 home\A home\C 而不需要home\B目录的话 这种需求需要修改代码 对AC分别监听（或者监听home 判断B跳过） 目前就不改动了
