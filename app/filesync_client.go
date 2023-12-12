@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -46,12 +47,7 @@ func (fsc *FileSyncClient) ListenAsk(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			msg, err := pubCh.ReceiveMessage()
-			if err != nil {
-				log.Println("listen ask: receive msg failed", err)
-				continue
-			}
+		case msg := <-pubCh.Channel():
 			ak := ask{}
 			_ = json.Unmarshal([]byte(msg.Payload), &ak)
 			// 不是向自己ask的msg 忽略
@@ -92,11 +88,14 @@ func (fsc *FileSyncClient) Ask(done chan struct{}) {
 	ctx, cancel := context.WithCancel(context.Background())
 	dbVersions, err := types.AllVersionInfo()
 	if err != nil {
-		log.Println("db get all version info failed", err)
+		log.Println("ask chasing: db get all version info failed", err)
 		cancel()
+		close(done)
 		return
 	}
 
+	// wg用于确保追赶的每一个文件都写入到本地
+	wg := sync.WaitGroup{}
 	go func() {
 		// 确保这个协程跑完再关闭管道
 		defer close(done)
@@ -107,12 +106,8 @@ func (fsc *FileSyncClient) Ask(done chan struct{}) {
 			select {
 			case <-ctx.Done():
 				return
-			default:
-				msg, err := pubCh.ReceiveMessage()
-				if err != nil {
-					log.Println("ask chasing file failed", err)
-					continue
-				}
+			case msg := <-pubCh.Channel():
+				// 这里改为了Channel 之前是default+ReceiveMessage 可能会阻塞ctx.Done的case
 				ans := answer{}
 				_ = json.Unmarshal([]byte(msg.Payload), &ans)
 				// 不是发送给自己的文件 忽略
@@ -121,10 +116,15 @@ func (fsc *FileSyncClient) Ask(done chan struct{}) {
 				}
 
 				//log.Println("got answer file", ans.FilePath)
+				dir, _ := filepath.Split(filepath.Join(fsc.PathPrefix, ans.FilePath))
+				_ = os.MkdirAll(dir, 0644)
+
 				err = os.WriteFile(filepath.Join(fsc.PathPrefix, ans.FilePath), ans.AfterContent, 0644)
 				if err != nil {
 					log.Println("ask chasing file failed", err)
 				}
+				// 每下载完一个文件 wait-1
+				wg.Done()
 			}
 		}
 	}()
@@ -159,16 +159,25 @@ func (fsc *FileSyncClient) Ask(done chan struct{}) {
 			continue
 		}
 		cacheVersion, ok := types.GetCacheVersion(info.FilePath)
-		if (!ok || cacheVersion < info.Version) && !info.IsDir() {
+		// 如果目标节点是自己就不用下载了
+		if (!ok || cacheVersion < info.Version) && !info.IsDir() && info.NodeId != fsc.UniqueId {
 			// publish 向目标节点请求下载文件
 			ak := ask{VersionInfo: types.VersionInfo{
 				FilePath: info.FilePath, // ask文件路径
 				NodeId:   info.NodeId,   // 向此节点ask文件数据
 			}, AskFrom: fsc.UniqueId}
 			askBytes, _ := json.Marshal(ak)
+
+			//log.Println("ask file", ak.FilePath, ak.NodeId)
+
+			// 每下载一个文件请求 wait+1
+			wg.Add(1)
 			fsc.Publish(types.VersionCompare, askBytes)
 		}
 	}
+
+	// 等待每一个文件都下载完成再终止子协程
+	wg.Wait()
 	cancel()
 }
 
@@ -194,7 +203,7 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 				continue
 			}
 			relPath := fsc.CalculateRelativePath(ei.Path())
-			fmt.Println("after content", string(afterContent), relPath)
+			//fmt.Println("after content", string(afterContent), relPath)
 
 			version, ok := fsc.CheckVersion(relPath)
 			if !ok {
@@ -242,7 +251,8 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 // CalculateRelativePath 计算变化的文件（夹）相对路径
 func (fsc *FileSyncClient) CalculateRelativePath(changePath string) string {
 	rel, _ := filepath.Rel(fsc.PathPrefix, changePath)
-	return rel
+	// 统一使用"/"作为路径分格符 否则filepath.Split在linux操作系统上可能无法正确解析"a\b\c\d.txt"这种路径
+	return filepath.ToSlash(rel)
 }
 
 func (fsc *FileSyncClient) SameFile(path1, path2 string) bool {
@@ -293,9 +303,13 @@ func (fsc *FileSyncClient) Synchronize(message *redis.Message) {
 	// todo 直接粘贴非空文件的时候 write+create（顺序不固定）
 	switch fc.ChangeType {
 	case notify.Write:
+		// 防止后面因为路径包含本地尚未存在的目录导致写入失败 即使目录已经存在MkdirAll也不会报错
+		dir, _ := filepath.Split(fc.FilePath)
+		_ = os.MkdirAll(dir, 0644)
+
 		err := os.WriteFile(fc.FilePath, fc.AfterContent, 0644)
 		if err != nil {
-			fmt.Println("write change content failed", err)
+			log.Println("write change content failed", err)
 			// 协程定期尝试重试更新
 			go fsc.TryWriteFile(fc)
 			break
@@ -310,14 +324,14 @@ func (fsc *FileSyncClient) Synchronize(message *redis.Message) {
 			err = os.WriteFile(fc.FilePath, nil, 0644)
 		}
 		if err != nil {
-			fmt.Println("create file or dir failed", err)
+			log.Println("create file or dir failed", err)
 		}
 
 	case notify.Remove:
 		// 使用RemoveAll 可以删除非空文件夹或文件
 		err := os.RemoveAll(fc.FilePath)
 		if err != nil {
-			fmt.Println("remove file failed", err)
+			log.Println("remove file failed", err)
 			go fsc.TryRemove(fc)
 		}
 
@@ -339,7 +353,7 @@ func (fsc *FileSyncClient) TryWriteFile(changes types.FileChanges) {
 
 		err := os.WriteFile(changes.FilePath, changes.AfterContent, 0644)
 		if err != nil {
-			fmt.Printf("retry update file[%v] failed: [%v]", changes.FilePath, err)
+			log.Printf("retry update file[%v] failed: [%v]\n", changes.FilePath, err)
 		} else {
 			types.UpdateCacheVersion(changes.FilePath, changes.FileVersion)
 			return
@@ -356,7 +370,7 @@ func (fsc *FileSyncClient) TryRemove(changes types.FileChanges) {
 
 		err := os.RemoveAll(changes.FilePath)
 		if err != nil {
-			fmt.Printf("retry remove [%v] failed: [%v]", changes.FilePath, err)
+			log.Printf("retry remove [%v] failed: [%v]\n", changes.FilePath, err)
 		} else {
 			return
 		}
