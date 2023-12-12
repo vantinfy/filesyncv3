@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -59,6 +60,7 @@ func (fsc *FileSyncClient) ListenAsk(ctx context.Context) {
 			content, err := os.ReadFile(filepath.Join(fsc.PathPrefix, ak.FilePath))
 			if err != nil {
 				log.Println("listen ask: read file failed", err)
+				fsc.Publish(types.ChasingFile, answerWithErr(ak.FilePath, fsc.UniqueId, ak.AskFrom, err))
 				continue
 			}
 			ans := answer{
@@ -81,6 +83,29 @@ type ask struct {
 type answer struct {
 	types.FileChanges
 	SendTo string `json:"send_to"`
+}
+
+const answerError = "??ERROR??"
+
+func answerWithErr(path, from, to string, err error) []byte {
+	ans := answer{
+		FileChanges: types.FileChanges{
+			FilePath:     path,
+			PublishFrom:  from,
+			AfterContent: []byte(answerError + err.Error()),
+		},
+		SendTo: to,
+	}
+
+	ansBytes, _ := json.Marshal(ans)
+	return ansBytes
+}
+
+func (a answer) isErr() (bool, string) {
+	if strings.HasPrefix(string(a.AfterContent), answerError) {
+		return true, strings.Split(string(a.AfterContent), answerError)[1]
+	}
+	return false, ""
 }
 
 // Ask 启动的时候 通过redis与数据库查询所有文件版本 比对本地cache 如果本地version落后则向其它节点请求文件
@@ -112,6 +137,11 @@ func (fsc *FileSyncClient) Ask(done chan struct{}) {
 				_ = json.Unmarshal([]byte(msg.Payload), &ans)
 				// 不是发送给自己的文件 忽略
 				if ans.SendTo != fsc.UniqueId {
+					continue
+				}
+				if isErr, errStr := ans.isErr(); isErr {
+					log.Println("ask chasing file err:", errStr)
+					wg.Done()
 					continue
 				}
 
