@@ -172,6 +172,13 @@ func (fsc *FileSyncClient) Ask(done chan struct{}) {
 
 	//考虑了path是目录以及删除文件（夹）的情况
 	for _, info := range redisVersions {
+		// 启动的时候可能本地cache被删过 重新set一次
+		cacheVersion, ok := types.GetCacheVersion(info.FilePath)
+		if !ok {
+			// redis的key以fs_开头 写入cache前需要将前缀去掉
+			types.UpdateCacheVersion(strings.TrimPrefix(info.FilePath, types.KeyPrefix), info.Version)
+		}
+
 		// 如果该路径已经被标记删除 这里同样执行删除即可
 		if info.IsDel() {
 			err = os.RemoveAll(info.FilePath)
@@ -188,7 +195,7 @@ func (fsc *FileSyncClient) Ask(done chan struct{}) {
 			}
 			continue
 		}
-		cacheVersion, ok := types.GetCacheVersion(info.FilePath)
+
 		// 如果目标节点是自己就不用下载了
 		if (!ok || cacheVersion < info.Version) && !info.IsDir() && info.NodeId != fsc.UniqueId {
 			// publish 向目标节点请求下载文件
@@ -214,7 +221,8 @@ func (fsc *FileSyncClient) Ask(done chan struct{}) {
 func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 	for {
 		ei := <-eventChan
-		fmt.Println("wait...", ei)
+		//fmt.Printf("wait...%v event sys %#v\n", ei, ei.Sys())
+
 		// .sync_cache和.key文件不同步
 		if fsc.SameFile(ei.Path(), types.SyncCachePath) || fsc.SameFile(ei.Path(), types.KeyPath) {
 			continue
@@ -227,13 +235,13 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 				continue
 			}
 
-			// write的情况下 变化的一定是文件 不是目录
+			// write的情况下 变化的一定是文件 不是目录 且注意redis一次publish的数据最多512MB
 			afterContent, err := os.ReadFile(ei.Path())
 			if err != nil {
 				continue
 			}
 			relPath := fsc.CalculateRelativePath(ei.Path())
-			//fmt.Println("after content", string(afterContent), relPath)
+			//fmt.Println("after content len", len(afterContent), relPath)
 
 			version, ok := fsc.CheckVersion(relPath)
 			if !ok {
@@ -269,6 +277,7 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 				types.WithVersion(version)))
 		case notify.Rename:
 			// linux下的重命名 跟windows逻辑不太一样 前者是rename+create 后者是double rename
+			// 如果是目录的重命名差别更大 linux是两个rename+create windows依然double rename
 			//if runtime.GOOS == "linux" {
 			//	continue
 			//}
@@ -320,15 +329,13 @@ func (fsc *FileSyncClient) CheckVersion(key string, options ...types.SetOption) 
 // Synchronize 接收到文件（夹）变化时 进行同步
 func (fsc *FileSyncClient) Synchronize(message *redis.Message) {
 	fc := types.Msg2FileChanges(message)
-	fc.FilePath = filepath.Join(fsc.PathPrefix, fc.FilePath) // 相对路径还原绝对路径
 
 	if fc.PublishFrom == fsc.UniqueId {
 		// 如果是自己广播的消息 不写文件 只更新version
 		types.UpdateCacheVersion(fc.FilePath, fc.FileVersion)
 		return
 	}
-	//fmt.Println("got file changes", fc)
-	//return
+	fc.FilePath = filepath.Join(fsc.PathPrefix, fc.FilePath) // 相对路径还原绝对路径
 
 	// todo 直接粘贴非空文件的时候 write+create（顺序不固定）
 	switch fc.ChangeType {

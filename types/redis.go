@@ -21,9 +21,16 @@ type RedisClient struct {
 const KeyPrefix = "fs_" // 因为redis是公共的 所以针对文件同步所存储的数据增加一个前缀 便于与其它数据区分
 
 var (
-	BaseExpire = time.Minute * 10 // redis key基础过期时间
-	RandSeed   = rand.New(rand.NewSource(time.Now().UnixNano()))
+	_mainExitCtx, _mainExitCancel = context.WithCancel(context.Background())
+	VersionWriteWG                = sync.WaitGroup{} // 用于确保主程序退出时每个redis写db的协程能完成落库
+	BaseExpire                    = time.Minute * 10 // redis key基础过期时间
+	RandSeed                      = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
+
+// MainExitCancel 提供对MainExitCancel 的访问函数
+func MainExitCancel() {
+	_mainExitCancel()
+}
 
 type ROption func(opt *redis.Options)
 
@@ -102,7 +109,9 @@ func (r *RedisClient) SetKey(key string, version int, nodeId string, options ...
 
 	// 也可以通过消息队列实现相同功能
 	// 每set一次key，则往队列添加一条消息 只要一个协程定期将队列的数据写到数据库即可（注意该协程的ticker间隔小于key过期时间）
+	VersionWriteWG.Add(1)
 	go func() {
+		defer VersionWriteWG.Done()
 		ticker := time.NewTicker(BaseExpire + randExp)
 		defer ticker.Stop()
 
@@ -111,20 +120,27 @@ func (r *RedisClient) SetKey(key string, version int, nodeId string, options ...
 		r.WriteCancel[key] = cancel
 		r.mu.Unlock()
 
-		select {
-		case <-ctx.Done():
-			// 触发了cancel() 取消此协程的执行 返回
-			return
-		case <-ticker.C:
+		f := func() {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 
 			// 走这个分支说明key到了过期的时间依然没有被更新过 因此可以将version写到db
 			_, err = UpdateDBVersion(key, *vInfo)
 			if err != nil {
-				log.Println(err)
+				log.Println("redis setKey goroutine went wrong", key, *vInfo, err)
 			}
 			delete(r.WriteCancel, key)
+		}
+
+		select {
+		case <-ctx.Done():
+			// 触发了cancel() 取消此协程的执行 返回
+			return
+		case <-ticker.C: // 时间到了写db
+			f()
+		case <-_mainExitCtx.Done(): // 或者主程序退出 提前写db 该key也提前删除
+			r.Client.Del(KeyPrefix + key)
+			f()
 		}
 	}()
 

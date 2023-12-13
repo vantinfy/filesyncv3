@@ -15,6 +15,9 @@ func main() {
 	api.Init(func() {
 		// 退出前终止listen协程与关闭数据库连接
 		cancel()
+		types.MainExitCancel()
+		types.VersionWriteWG.Wait() // 阻塞 等待所有的redis key写完db
+
 		types.CloseDb()
 	})
 
