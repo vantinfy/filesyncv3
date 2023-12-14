@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"filesyncv3/types"
 	"fmt"
 	"github.com/go-redis/redis"
@@ -10,8 +9,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
-	"sync"
 	"time"
 )
 
@@ -19,6 +16,8 @@ type FileSyncClient struct {
 	*types.RedisClient
 	*types.SyncConfig
 	types.NodeInfo
+	Ctx    context.Context    // 主ctx
+	Cancel context.CancelFunc // 正常退出的时候会调用这个Cancel方法
 }
 
 var fileSyncClient *FileSyncClient
@@ -36,186 +35,11 @@ func NewFileSyncClient() *FileSyncClient {
 			NodeInfo:    types.NodeInfo{},
 		}
 		_ = fileSyncClient.LoadPrivateKey()
+
+		// 全局上下文
+		fileSyncClient.Ctx, fileSyncClient.Cancel = context.WithCancel(context.Background())
 	}
 	return fileSyncClient
-}
-
-func (fsc *FileSyncClient) ListenAsk(ctx context.Context) {
-	pubCh := fsc.Subscribe(types.VersionCompare)
-	defer pubCh.Close()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg := <-pubCh.Channel():
-			ak := ask{}
-			_ = json.Unmarshal([]byte(msg.Payload), &ak)
-			// 不是向自己ask的msg 忽略
-			if ak.NodeId != fsc.UniqueId {
-				continue
-			}
-
-			// 发送文件
-			content, err := os.ReadFile(filepath.Join(fsc.PathPrefix, ak.FilePath))
-			if err != nil {
-				log.Println("listen ask: read file failed", err)
-				fsc.Publish(types.ChasingFile, answerWithErr(ak.FilePath, fsc.UniqueId, ak.AskFrom, err))
-				continue
-			}
-			ans := answer{
-				FileChanges: types.FileChanges{
-					FilePath:     ak.FilePath,
-					PublishFrom:  fsc.UniqueId,
-					AfterContent: content,
-				}, SendTo: ak.AskFrom}
-			ansBytes, _ := json.Marshal(ans)
-			fsc.Publish(types.ChasingFile, ansBytes)
-		}
-	}
-}
-
-type ask struct {
-	types.VersionInfo
-	AskFrom string `json:"ask_from"`
-}
-
-type answer struct {
-	types.FileChanges
-	SendTo string `json:"send_to"`
-}
-
-const answerError = "??ERROR??"
-
-func answerWithErr(path, from, to string, err error) []byte {
-	ans := answer{
-		FileChanges: types.FileChanges{
-			FilePath:     path,
-			PublishFrom:  from,
-			AfterContent: []byte(answerError + err.Error()),
-		},
-		SendTo: to,
-	}
-
-	ansBytes, _ := json.Marshal(ans)
-	return ansBytes
-}
-
-func (a answer) isErr() (bool, string) {
-	if strings.HasPrefix(string(a.AfterContent), answerError) {
-		return true, strings.Split(string(a.AfterContent), answerError)[1]
-	}
-	return false, ""
-}
-
-// Ask 启动的时候 通过redis与数据库查询所有文件版本 比对本地cache 如果本地version落后则向其它节点请求文件
-func (fsc *FileSyncClient) Ask(done chan struct{}) {
-	ctx, cancel := context.WithCancel(context.Background())
-	dbVersions, err := types.AllVersionInfo()
-	if err != nil {
-		log.Println("ask chasing: db get all version info failed", err)
-		cancel()
-		close(done)
-		return
-	}
-
-	// wg用于确保追赶的每一个文件都写入到本地
-	wg := sync.WaitGroup{}
-	go func() {
-		// 确保这个协程跑完再关闭管道
-		defer close(done)
-		pubCh := fsc.Subscribe(types.ChasingFile)
-		defer pubCh.Close()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case msg := <-pubCh.Channel():
-				// 这里改为了Channel 之前是default+ReceiveMessage 可能会阻塞ctx.Done的case
-				ans := answer{}
-				_ = json.Unmarshal([]byte(msg.Payload), &ans)
-				// 不是发送给自己的文件 忽略
-				if ans.SendTo != fsc.UniqueId {
-					continue
-				}
-				if isErr, errStr := ans.isErr(); isErr {
-					log.Println("ask chasing file err:", errStr)
-					wg.Done()
-					continue
-				}
-
-				//log.Println("got answer file", ans.FilePath)
-				dir, _ := filepath.Split(filepath.Join(fsc.PathPrefix, ans.FilePath))
-				_ = os.MkdirAll(dir, 0644)
-
-				err = os.WriteFile(filepath.Join(fsc.PathPrefix, ans.FilePath), ans.AfterContent, 0644)
-				if err != nil {
-					log.Println("ask chasing file failed", err)
-				}
-				// 每下载完一个文件 wait-1
-				wg.Done()
-			}
-		}
-	}()
-
-	redisVersions := fsc.RedisClient.ScanKeys()
-	for _, dbV := range dbVersions {
-		// db与redis都有的filepath 以redis为准
-		if _, ok := redisVersions[dbV.FilePath]; ok {
-			continue
-		} else {
-			redisVersions[dbV.FilePath] = dbV
-		}
-	}
-	//log.Println("try to chasing", redisVersions)
-
-	//考虑了path是目录以及删除文件（夹）的情况
-	for _, info := range redisVersions {
-		// 启动的时候可能本地cache被删过 重新set一次
-		cacheVersion, ok := types.GetCacheVersion(info.FilePath)
-		if !ok {
-			// redis的key以fs_开头 写入cache前需要将前缀去掉
-			types.UpdateCacheVersion(strings.TrimPrefix(info.FilePath, types.KeyPrefix), info.Version)
-		}
-
-		// 如果该路径已经被标记删除 这里同样执行删除即可
-		if info.IsDel() {
-			err = os.RemoveAll(info.FilePath)
-			if err != nil {
-				log.Printf("ask chasing file, remove[%v] failed[%v]\n", info.FilePath, err)
-			}
-			continue
-		}
-		// 是目录的话 直接创建 不需要向其它节点请求下载
-		if info.IsDir() {
-			err = os.MkdirAll(info.FilePath, 0644)
-			if err != nil {
-				log.Printf("ask chasing file, mkdirAll[%v] failed[%v]\n", info.FilePath, err)
-			}
-			continue
-		}
-
-		// 如果目标节点是自己就不用下载了
-		if (!ok || cacheVersion < info.Version) && !info.IsDir() && info.NodeId != fsc.UniqueId {
-			// publish 向目标节点请求下载文件
-			ak := ask{VersionInfo: types.VersionInfo{
-				FilePath: info.FilePath, // ask文件路径
-				NodeId:   info.NodeId,   // 向此节点ask文件数据
-			}, AskFrom: fsc.UniqueId}
-			askBytes, _ := json.Marshal(ak)
-
-			//log.Println("ask file", ak.FilePath, ak.NodeId)
-
-			// 每下载一个文件请求 wait+1
-			wg.Add(1)
-			fsc.Publish(types.VersionCompare, askBytes)
-		}
-	}
-
-	// 等待每一个文件都下载完成再终止子协程
-	wg.Wait()
-	cancel()
 }
 
 func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
@@ -337,7 +161,8 @@ func (fsc *FileSyncClient) Synchronize(message *redis.Message) {
 	}
 	fc.FilePath = filepath.Join(fsc.PathPrefix, fc.FilePath) // 相对路径还原绝对路径
 
-	// todo 直接粘贴非空文件的时候 write+create（顺序不固定）
+	// todo 直接粘贴非空文件到监视目录下的时候 write+create（顺序不固定）
+	// 且难点在于linux中cp、mv大文件（本地测试Ubuntu虚拟机18.04server 20M+的文件）的时候会触发多个write信号 如何判断最后一次write是文件写完
 	switch fc.ChangeType {
 	case notify.Write:
 		// 防止后面因为路径包含本地尚未存在的目录导致写入失败 即使目录已经存在MkdirAll也不会报错
@@ -355,8 +180,12 @@ func (fsc *FileSyncClient) Synchronize(message *redis.Message) {
 
 	case notify.Create:
 		var err error
+		if _, err = os.Stat(fc.FilePath); err == nil {
+			// 路径已经存在 跳过创建 （因为如果这个情况下create/write文件 会导致原有文件被清空）
+			break
+		}
 		if fc.IsDir { // 创建的是文件夹
-			err = os.Mkdir(fc.FilePath, 0644)
+			err = os.MkdirAll(fc.FilePath, 0644)
 		} else { // 新建文件
 			err = os.WriteFile(fc.FilePath, nil, 0644)
 		}

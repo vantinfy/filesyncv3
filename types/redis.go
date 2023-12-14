@@ -21,15 +21,14 @@ type RedisClient struct {
 const KeyPrefix = "fs_" // 因为redis是公共的 所以针对文件同步所存储的数据增加一个前缀 便于与其它数据区分
 
 var (
-	_mainExitCtx, _mainExitCancel = context.WithCancel(context.Background())
-	VersionWriteWG                = sync.WaitGroup{} // 用于确保主程序退出时每个redis写db的协程能完成落库
-	BaseExpire                    = time.Minute * 10 // redis key基础过期时间
-	RandSeed                      = rand.New(rand.NewSource(time.Now().UnixNano()))
+	_mainExitCtx   context.Context
+	VersionWriteWG = sync.WaitGroup{} // 用于确保主程序退出时每个redis写db的协程能完成落库
+	BaseExpire     = time.Minute * 10 // redis key基础过期时间
+	RandSeed       = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
 
-// MainExitCancel 提供对MainExitCancel 的访问函数
-func MainExitCancel() {
-	_mainExitCancel()
+func SetMainCtx(ctx context.Context) {
+	_mainExitCtx = ctx
 }
 
 type ROption func(opt *redis.Options)
@@ -166,7 +165,7 @@ func (r *RedisClient) GetKey(key string) (int, error) {
 }
 
 func (r *RedisClient) ScanKeys() map[string]VersionInfo {
-	keys := r.Client.Keys("*").Val()
+	keys := r.Client.Keys(KeyPrefix + "*").Val()
 	resp := make(map[string]VersionInfo, len(keys))
 
 	for _, key := range keys {

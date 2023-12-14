@@ -35,6 +35,10 @@ func GetCacheVersion(filePath string) (int, bool) {
 	return 0, false
 }
 
+func ShowCache() map[string]cache.Item {
+	return FileVersionCache.Items()
+}
+
 func SaveCacheToFile(filename string) error {
 	Mutex.Lock()
 	defer Mutex.Unlock()
