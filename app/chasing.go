@@ -21,6 +21,10 @@ func (fsc *FileSyncClient) ListenAsk(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case msg := <-pubCh.Channel():
+			if msg == nil {
+				// 走这个分支表示chan已经关闭 所以拿到nil
+				return
+			}
 			ak := ask{}
 			_ = json.Unmarshal([]byte(msg.Payload), &ak)
 			// 不是向自己ask的msg 忽略
@@ -105,6 +109,10 @@ func (fsc *FileSyncClient) Ask(done chan string) {
 				done <- "success"
 				return
 			case msg := <-pubCh.Channel():
+				if msg == nil {
+					done <- fmt.Sprintf("subscribe channel[%s] closed", types.ChasingFile)
+					return
+				}
 				// 这里改为了Channel 之前是default+ReceiveMessage 可能会阻塞ctx.Done的case
 				ans := answer{}
 				_ = json.Unmarshal([]byte(msg.Payload), &ans)
