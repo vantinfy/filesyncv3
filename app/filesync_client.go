@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -42,6 +43,31 @@ func NewFileSyncClient() *FileSyncClient {
 	return fileSyncClient
 }
 
+func readFile(path string) ([]byte, error) {
+	// windows.ERROR_SHARING_VIOLATION 也就是 syscall.Errno(0x20)
+	const windowsErrSharingViolation = "The process cannot access the file because it is being used by another process."
+	retryCnt := 10
+
+retry:
+	fBytes, err := os.ReadFile(path)
+	if err != nil {
+		// 这里不能直接用errors.Is(err, windows.ERROR_SHARING_VIOLATION) 因为windows包在linux上编译不通过
+		// 直接用syscall.Errno(0x20)理论可行 但是linux上的0x20错误是"broken pipe"
+		// 所以最后还是采用字符串判断的方式
+		if strings.Contains(err.Error(), windowsErrSharingViolation) && retryCnt > 0 {
+			time.Sleep(time.Millisecond * 100)
+			retryCnt--
+			goto retry
+		} else {
+			return fBytes, err
+		}
+	}
+
+	// 即使成功读取文件 还无法确定读取到的文件是否完整（linux系统支持一个进程写文件的过程中 另一个进程读取该文件）
+	// 这个问题已经通过将linux上的监听信号从write细化为InCloseWrite解决
+	return fBytes, nil
+}
+
 func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 	for {
 		ei := <-eventChan
@@ -53,15 +79,24 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 		}
 
 		switch ei.Event() {
+		/* ------------------------------ Write --------------------------------- */
+		case notify.Event(0x8):
+			// linux inotify信号 InCloseWrite
+			// 区分linux的write是因为 cp或者mv一个大文件的时候 linux上会分为多次写入
+			// 此时要判断最后一次写入文件比较复杂 直接监听InCloseWrite信号方便很多
+			fallthrough
 		case notify.Write:
 			fileInfo, err := os.Stat(ei.Path())
 			if err != nil {
 				continue
 			}
 
-			// write的情况下 变化的一定是文件 不是目录 且注意redis一次publish的数据最多512MB
-			afterContent, err := os.ReadFile(ei.Path())
+			// write的情况下 变化的一定是文件 不是目录 且注意redis的publish/subscribe机制不适用大数据传输
+			// windows中 直接粘贴大文件的情况下可能该文件被占用导致报错: The process cannot access the file because it is being used by another process.
+			// 而在linux中 操作系统允许在写一个文件的时候让另一个文件读取 这个情况下读取的文件可能是不完整的
+			afterContent, err := readFile(ei.Path())
 			if err != nil {
+				log.Println("watch write signal: read file failed", ei.Path(), err)
 				continue
 			}
 			relPath := fsc.CalculateRelativePath(ei.Path())
@@ -71,11 +106,28 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 			if !ok {
 				continue
 			}
+			// 大于16MB的数据不通过pub/sub发布 理论上最好是分片文件 发布变化的文件块 但是实现难度大
+			// 这里使用redis set将文件临时存放到redis（30s） 这个方案极限情况下如果短时间多个大文件变化 可能会导致redis占用内存过大导致崩溃
+			// 另一个方案思路：afterContent提供一个下载链接，其它节点直接通过连接向发生变化的节点下载文件 但是同样要考虑一些特殊情况，比如文件下载过程中文件重新变化这些问题
+			if len(afterContent) > 16*1024*1024 {
+				// todo redis file block 1024*200（单key200KB，再大rdm就卡顿读取不了了）
+				//afterContent = []byte("OnRedis_" + relPath)
+			}
 			fsc.Publish(types.FileChange, types.NewFileChanges(relPath, ei.Event(),
 				types.WithFileContent(afterContent),
 				types.WithLastUpdate(fileInfo.ModTime().UnixNano()),
 				types.WithPublishFrom(fsc.UniqueId),
 				types.WithVersion(version)))
+
+		/* ------------------------------ Create --------------------------------- */
+		case notify.Event(0x100): // linux InCreate
+			fallthrough
+		case notify.Event(1) << 12:
+			// windows Added
+			// 这里还有一个小问题：windows上通过剪切粘贴（或者cmd的move命令），来移动文件的时候
+			// 如果前后文件在一个目录下（也就是重命名） 是可以正确识别为rename的
+			// 但是如果前后不在一个目录下（也就是真正的移动文件） windows信号是Added和Removed
+			fallthrough
 		case notify.Create:
 			relPath := fsc.CalculateRelativePath(ei.Path())
 			fileInfo, err := os.Stat(ei.Path())
@@ -90,6 +142,12 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 				types.WithIsDir(fileInfo.IsDir()),
 				types.WithPublishFrom(fsc.UniqueId),
 				types.WithVersion(version)))
+
+		/* ------------------------------ Delete --------------------------------- */
+		case notify.Event(0x200): // linux InDelete
+			fallthrough
+		case notify.Event(2) << 12: // windows Removed
+			fallthrough
 		case notify.Remove:
 			relPath := fsc.CalculateRelativePath(ei.Path())
 			version, ok := fsc.CheckVersion(relPath, types.SetWithDel(true))
@@ -99,7 +157,9 @@ func (fsc *FileSyncClient) Watch(eventChan chan notify.EventInfo) {
 			fsc.Publish(types.FileChange, types.NewFileChanges(relPath, ei.Event(),
 				types.WithPublishFrom(fsc.UniqueId),
 				types.WithVersion(version)))
-		case notify.Rename:
+
+		/* ------------------------------ Rename --------------------------------- */
+		case notify.Rename: // todo 后续细化为win.RenameOld RenameNew与linux.MoveFrom（0x40） MoveTo（0x80）实现
 			// linux下的重命名 跟windows逻辑不太一样 前者是rename+create 后者是double rename
 			// 如果是目录的重命名差别更大 linux是两个rename+create windows依然double rename
 			//if runtime.GOOS == "linux" {

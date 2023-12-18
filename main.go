@@ -6,6 +6,7 @@ import (
 	"filesyncv3/types"
 	"github.com/rjeczalik/notify"
 	"log"
+	"runtime"
 )
 
 func main() {
@@ -42,8 +43,24 @@ func main() {
 	// 注意监听的目标是文件夹 不是具体文件
 	// 另外如果有需要监听 home\A home\C 而不需要home\B目录的话 这种需求需要修改代码 对AC分别监听（或者监听home 判断B跳过） 目前就不改动了
 	// watch路径带`...`表示递归监听子目录
-	if err := notify.Watch(syncClient.WatchPath, eventChan, notify.All); err != nil {
-		log.Fatal(err)
+	var watchTypes []notify.Event
+	switch runtime.GOOS {
+	case "linux":
+		// 0x8-InCloseWrite 0x100-InCreate 0x200-InDelete 0x40-MoveFrom 0x80-MoveTo
+		watchTypes = []notify.Event{notify.Event(0x8), notify.Event(0x100), notify.Event(0x200), notify.Event(0x40), notify.Event(0x80)}
+	case "windows":
+		// 1-FileNotifyChangeFileName 2-FileNotifyChangeDirName 这两个已经监视文件/目录的增删重命名
+		// https://github.com/rjeczalik/notify/issues/10#issuecomment-66179535
+		watchTypes = []notify.Event{notify.Event(1), notify.Event(2), notify.Write}
+	default:
+		log.Printf("unsupported OS type:[%v]\n", runtime.GOOS)
+		beforeExit()
+		return
+	}
+	if err := notify.Watch(syncClient.WatchPath, eventChan, watchTypes...); err != nil {
+		log.Println(err)
+		beforeExit()
+		return
 	}
 	defer notify.Stop(eventChan)
 
