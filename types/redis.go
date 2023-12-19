@@ -52,7 +52,9 @@ func WithRedisDB(dbIndex int) ROption {
 }
 
 func NewRedisClient(opts ...ROption) *RedisClient {
-	opt := &redis.Options{}
+	opt := &redis.Options{
+		ReadTimeout: -1,
+	}
 	for _, option := range opts {
 		option(opt)
 	}
